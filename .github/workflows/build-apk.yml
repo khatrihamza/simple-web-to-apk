@@ -1,256 +1,177 @@
-name: Build Website APK
+name: Build APK
 
 on:
   repository_dispatch:
-    types: [website_to_apk]
+    types: [build-apk]
 
 permissions:
   contents: write
 
-concurrency:
-  group: apk-${{ github.event.client_payload.job_id }}
-  cancel-in-progress: false
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-
-    env:
-      JOB_ID: ${{ github.event.client_payload.job_id }}
-      WEBSITE_URL: ${{ github.event.client_payload.website_url }}
-      APP_NAME: ${{ github.event.client_payload.app_name }}
-      PACKAGE_ID: ${{ github.event.client_payload.package_id }}
-      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-      CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+    timeout-minutes: 25
 
     steps:
-      - name: Check request
-        shell: bash
+      - name: Notify PHP — building started
+        env:
+          CB_URL: ${{ github.event.client_payload.callback_url }}
+          CB_SECRET: ${{ github.event.client_payload.callback_secret }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
         run: |
-          python3 - <<'PY'
-          import os, re, sys
-          from urllib.parse import urlparse
+          [ -z "$CB_URL" ] && exit 0
+          curl -s -X POST "$CB_URL" -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CB_SECRET" \
+            -d "{\"job_id\":\"$JOB_ID\",\"status\":\"building\",\"step\":\"building\"}" || true
 
-          job = os.environ.get("JOB_ID", "")
-          name = os.environ.get("APP_NAME", "")
-          package = os.environ.get("PACKAGE_ID", "")
-          url = os.environ.get("WEBSITE_URL", "")
-          callback = os.environ.get("CALLBACK_URL", "")
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-          if not re.fullmatch(r"[a-f0-9]{32}", job):
-              sys.exit("Invalid job ID")
-
-          if not name or len(name) > 50 or any(ord(c) < 32 for c in name):
-              sys.exit("Invalid app name")
-
-          if not re.fullmatch(
-              r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*){2,}",
-              package
-          ):
-              sys.exit("Invalid Android package ID")
-
-          parsed = urlparse(url)
-          if parsed.scheme != "https" or not parsed.hostname:
-              sys.exit("Only HTTPS websites are supported")
-
-          host = parsed.hostname.lower().rstrip(".")
-          if host == "localhost" or host.endswith((".localhost", ".local")):
-              sys.exit("Local websites are not supported")
-
-          if not callback.startswith("https://"):
-              sys.exit("Callback URL must use HTTPS")
-
-          print("Request checks passed.")
-          PY
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android build tools
-        shell: bash
-        run: |
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      - uses: android-actions/setup-android@v3
 
       - name: Install Cordova
-        shell: bash
+        run: npm install -g cordova
+
+      - name: Create Cordova project from scratch
+        env:
+          URL: ${{ github.event.client_payload.url }}
+          APP_NAME: ${{ github.event.client_payload.app_name }}
+          PACKAGE: ${{ github.event.client_payload.package }}
         run: |
-          npm install --global cordova@12
+          cordova create work "$PACKAGE" "$APP_NAME"
+          cd work
 
-      - name: Create Cordova application
-        shell: bash
+          # Write config.xml (no template file needed)
+          cat > config.xml <<EOF
+          <?xml version='1.0' encoding='utf-8'?>
+          <widget id="$PACKAGE" version="1.0.0"
+                  xmlns="http://www.w3.org/ns/widgets"
+                  xmlns:cdv="http://cordova.apache.org/ns/1.0">
+              <name>$APP_NAME</name>
+              <description>Website to APK wrapper</description>
+              <author email="you@example.com" href="https://github.com/${{ github.repository_owner }}">${{ github.repository_owner }}</author>
+              <content src="$URL" />
+              <allow-navigation href="*" />
+              <allow-intent href="*" />
+              <access origin="*" />
+              <preference name="AndroidInsecureFileModeEnabled" value="true" />
+              <preference name="SplashMaintainAspectRatio" value="true" />
+              <preference name="AndroidPersistentFileLocation" value="Internal" />
+          </widget>
+          EOF
+
+          # Write www/index.html (loading page)
+          cat > www/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html><head><meta charset="utf-8"><title>Loading…</title>
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <style>body{font-family:sans-serif;text-align:center;padding-top:40vh;color:#555}</style>
+          </head><body><p>Loading…</p></body></html>
+          EOF
+
+      - name: Generate signing keystore
+        working-directory: work
         run: |
-          set -euo pipefail
+          keytool -genkeypair -v -keystore app.keystore -alias app \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=App, OU=Dev, O=Org, L=City, S=State, C=IN"
 
-          WORKDIR="$RUNNER_TEMP/website-apk"
-          mkdir -p "$WORKDIR"
-
-          cordova create "$WORKDIR" "$PACKAGE_ID" "$APP_NAME"
-
-          export WORKDIR
-          python3 - <<'PY'
-          import os
-          from html import escape
-          from pathlib import Path
-          from urllib.parse import urlparse
-
-          work = Path(os.environ["WORKDIR"])
-          url = os.environ["WEBSITE_URL"]
-          parsed = urlparse(url)
-
-          # Resolve DNS and reject private/local IPv4 or IPv6 addresses.
-          import socket
-          import ipaddress
-
-          try:
-              addresses = socket.getaddrinfo(
-                  parsed.hostname, 443, type=socket.SOCK_STREAM
-              )
-          except socket.gaierror:
-              raise SystemExit("Website hostname could not be resolved")
-
-          if not addresses:
-              raise SystemExit("No website IP address found")
-
-          for item in addresses:
-              ip = ipaddress.ip_address(item[4][0])
-              if not ip.is_global:
-                  raise SystemExit("Private or local website addresses are blocked")
-
-          page = """<!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <meta name="theme-color" content="#101114">
-            <title>Website App</title>
-            <style>
-              html,body,iframe{margin:0;width:100%;height:100%;border:0}
-              body{background:#101114}
-            </style>
-          </head>
-          <body>
-            <iframe title="Website" src="TARGET_URL"
-              referrerpolicy="strict-origin-when-cross-origin"
-              allow="clipboard-read; clipboard-write"></iframe>
-          </body>
-          </html>
-          """.replace("TARGET_URL", escape(url, quote=True))
-
-          (work / "www" / "index.html").write_text(page, encoding="utf-8")
-          PY
-
-          cd "$WORKDIR"
-          cordova platform add android@13
-          cordova build android --debug
-
-          echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
-
-      - name: Sign APK
-        shell: bash
+      - name: Write build.json
+        working-directory: work
         run: |
-          set -euo pipefail
+          cat > build.json <<'EOF'
+          {
+            "android": {
+              "release": {
+                "keystore": "app.keystore",
+                "storePassword": "android",
+                "alias": "app",
+                "password": "android",
+                "keystoreType": "jks"
+              }
+            }
+          }
+          EOF
 
-          UNSIGNED="$WORKDIR/platforms/android/app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$UNSIGNED" ]; then
-            echo "APK was not created at the expected path."
-            exit 1
-          fi
+      - name: Add Android platform
+        working-directory: work
+        run: cordova platform add android
 
-          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
-          KEYSTORE="$RUNNER_TEMP/build-key.jks"
-          ALIGNED="$RUNNER_TEMP/aligned.apk"
-          OUTPUT="$RUNNER_TEMP/website-${JOB_ID}.apk"
+      - name: Notify PHP — signing
+        env:
+          CB_URL: ${{ github.event.client_payload.callback_url }}
+          CB_SECRET: ${{ github.event.client_payload.callback_secret }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          [ -z "$CB_URL" ] && exit 0
+          curl -s -X POST "$CB_URL" -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CB_SECRET" \
+            -d "{\"job_id\":\"$JOB_ID\",\"status\":\"signing\",\"step\":\"signing\"}" || true
 
-          KS_PASS="$(openssl rand -hex 24)"
+      - name: Build release APK
+        working-directory: work
+        run: cordova build android --release
 
-          keytool -genkeypair -noprompt \
-            -keystore "$KEYSTORE" \
-            -storepass "$KS_PASS" \
-            -keypass "$KS_PASS" \
-            -alias webapk \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Website APK Builder"
+      - name: Rename APK
+        env:
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          APK=$(find work/platforms/android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          mv "$APK" "work/app-$JOB_ID.apk"
+          ls -lh "work/app-$JOB_ID.apk"
 
-          "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" "$ALIGNED"
+      - name: Notify PHP — uploading
+        env:
+          CB_URL: ${{ github.event.client_payload.callback_url }}
+          CB_SECRET: ${{ github.event.client_payload.callback_secret }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          [ -z "$CB_URL" ] && exit 0
+          curl -s -X POST "$CB_URL" -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CB_SECRET" \
+            -d "{\"job_id\":\"$JOB_ID\",\"status\":\"uploading\",\"step\":\"uploading\"}" || true
 
-          "$BUILD_TOOLS/apksigner" sign \
-            --ks "$KEYSTORE" \
-            --ks-key-alias webapk \
-            --ks-pass "pass:$KS_PASS" \
-            --key-pass "pass:$KS_PASS" \
-            --out "$OUTPUT" \
-            "$ALIGNED"
-
-          "$BUILD_TOOLS/apksigner" verify "$OUTPUT"
-          echo "APK_PATH=$OUTPUT" >> "$GITHUB_ENV"
-
-      - name: Publish APK release
-        id: release
+      - name: Create GitHub Release with APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.event.client_payload.job_id }}
-          name: APK build ${{ github.event.client_payload.job_id }}
-          prerelease: true
-          files: ${{ env.APK_PATH }}
-          fail_on_unmatched_files: true
-
-      - name: Notify PHP that build succeeded
-        if: success()
-        shell: bash
+          name: "APK — ${{ github.event.client_payload.app_name }}"
+          body: |
+            Auto-built APK
+            Website: ${{ github.event.client_payload.url }}
+            Package: ${{ github.event.client_payload.package }}
+          files: work/app-${{ github.event.client_payload.job_id }}.apk
         env:
-          RELEASE_URL: https://github.com/${{ github.repository }}/releases/download/apk-${{ github.event.client_payload.job_id }}/website-${{ github.event.client_payload.job_id }}.apk
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify PHP — done
+        if: success()
+        env:
+          CB_URL: ${{ github.event.client_payload.callback_url }}
+          CB_SECRET: ${{ github.event.client_payload.callback_secret }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          set -euo pipefail
+          [ -z "$CB_URL" ] && exit 0
+          curl -s -X POST "$CB_URL" -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CB_SECRET" \
+            -d "{\"job_id\":\"$JOB_ID\",\"status\":\"done\",\"step\":\"done\",\"run_id\":\"$RUN_ID\"}" || true
 
-          BODY="$(python3 -c \
-            'import json,os; print(json.dumps({
-              "job_id": os.environ["JOB_ID"],
-              "status": "success",
-              "message": "APK built and published.",
-              "download_url": os.environ["RELEASE_URL"]
-            }))')"
-
-          curl --fail --silent --show-error --max-time 20 \
-            -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Build-Secret: $CALLBACK_SECRET" \
-            --data "$BODY"
-
-      - name: Notify PHP that build failed
+      - name: Notify PHP — failed
         if: failure()
-        shell: bash
+        env:
+          CB_URL: ${{ github.event.client_payload.callback_url }}
+          CB_SECRET: ${{ github.event.client_payload.callback_secret }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
         run: |
-          if [ -z "$CALLBACK_URL" ] || [ -z "$CALLBACK_SECRET" ]; then
-            echo "Callback URL or secret is missing."
-            exit 0
-          fi
-
-          BODY="$(python3 -c \
-            'import json,os; print(json.dumps({
-              "job_id": os.environ.get("JOB_ID", ""),
-              "status": "failure",
-              "message": "Build failed. Open GitHub Actions logs to see the error."
-            }))')"
-
-          curl --silent --show-error --max-time 20 \
-            -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Build-Secret: $CALLBACK_SECRET" \
-            --data "$BODY" || true
+          [ -z "$CB_URL" ] && exit 0
+          curl -s -X POST "$CB_URL" -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CB_SECRET" \
+            -d "{\"job_id\":\"$JOB_ID\",\"status\":\"failed\",\"step\":\"failed\"}" || true
